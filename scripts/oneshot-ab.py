@@ -139,6 +139,7 @@ def request(state, out, reuse):
    (out/'prompt-plan.json').write_text(json.dumps({'source_records':records,'source_tokens':original_count,'input_tokens':token_count,'construction':f'first {token_count-200} and final 200 tokenizer tokens; retained chat template suffix','token_ids_sha256':prompt_hash,'completion_requests':1,'n_predict':predict},indent=2)+'\n')
    print(f'Prefill: enviando {token_count} tokens; generación: {predict} tokens',flush=True)
    payload={'prompt':prompt,'n_predict':predict,'temperature':0,'cache_prompt':reuse,'stream':True,'return_tokens':True,'ignore_eos':True}
+   payload.update(json.loads(os.environ.get('AB_PAYLOAD','{}')))   # A/B diagnostics only (e.g. n_probs)
    (out/f'payload-{i}.json').write_text(json.dumps(payload,indent=2,ensure_ascii=False)+'\n')
    offset=(out/'engine.log').stat().st_size
    started=time.monotonic_ns(); state.update(request_index=i,request_started_ns=started,last_token_ns=None,prefill_progress_ns=started,prefill_tokens=0,prefill_trace_us=started//1000,progress_log_offset=offset)

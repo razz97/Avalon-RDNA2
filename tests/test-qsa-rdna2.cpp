@@ -287,6 +287,8 @@ static built build(const tcase & c, float scale, bool with_dense) {
     return b;
 }
 
+static int g_skipped = 0;   // cases not run (allocation failure): never counted as PASS
+
 static bool run_case(const tcase & c, uint64_t seed, bool bench) {
     std::mt19937_64 rng(seed);
     const float scale = 1.0f/16.0f;
@@ -294,7 +296,7 @@ static bool run_case(const tcase & c, uint64_t seed, bool bench) {
     fflush(stdout);
     const inputs in = make_inputs(c, rng);
     built b = build(c, scale, c.dense_ref);
-    if (!b.buf) { printf("SKIP (out of memory allocating the case)\n"); return true; }
+    if (!b.buf) { printf("SKIP (out of memory allocating the case)\n"); g_skipped++; return true; }
     upload(c, in, b);
     bool ok = true;
     std::string report;
@@ -334,7 +336,7 @@ static bool run_case(const tcase & c, uint64_t seed, bool bench) {
     const std::vector<float> ref = cpu_reference(c, in, scale);
     // the output of the flash attention: [D, n_head, n_t] contiguous, element ((t*n_head + h)*D + d), as `ref`
     const stats s = compare(first, ref);
-    const bool pass = s.n_nan == 0 && s.nrmse <= 3e-3 && s.max_abs <= 0.05;
+    const bool pass = s.n_nan == 0 && s.nrmse <= 3e-3 && s.max_abs <= 0.05*std::max(1.0f, c.vscale);   // absolute gate scaled by the V magnitude of the case
     ok = ok && pass;
     char buf[256];
     snprintf(buf, sizeof(buf), "cpu: nrmse=%.2e max=%.2e p99=%.2e nan=%" PRId64, s.nrmse, s.max_abs, s.p99, s.n_nan);
@@ -438,6 +440,7 @@ int main(int argc, char ** argv) {
     { auto c = mk("all-masked-by-causality", 32768, 64, 2304); c.all_masked = true; c.dense_ref = false; cases.push_back(c); }  // a fully masked row is NaN in the dense path
     { auto c = mk("kv-not-permuted", 32768, 64, 2304); c.kv_perm = false; c.q_perm = false; cases.push_back(c); }
     { auto c = mk("q-f16", 32768, 64, 2304); c.q_type = GGML_TYPE_F16; c.dense_ref = false; cases.push_back(c); }
+    { auto c = mk("nsel-partial-2300", 32768, 64, 2300); cases.push_back(c); }   // n_sel not a multiple of the 32-slot step
     { auto c = mk("big-k-values", 32768, 64, 2304); c.kscale = 3.0f; c.vscale = 4.0f; cases.push_back(c); }
     { auto c = mk("small-values", 32768, 64, 2304); c.kscale = 1e-3f; c.vscale = 1e-3f; cases.push_back(c); }
     if (!quick) {
@@ -459,7 +462,8 @@ int main(int argc, char ** argv) {
         const int64_t nts[] = { 4096, 8192 };
         for (int64_t n_kv : kvs) for (int64_t n_t : nts) { bench_case(n_kv, n_t, 2304, 5, rng); }
     }
-    printf("RESULT: %d/%d cases %s\n", total - fail, total, fail ? "FAILED" : "PASS");
+    // a skipped case (allocation failure) is neither a pass nor silently ignored: it fails the matrix
+    printf("RESULT: %d/%d cases %s (skipped: %d)\n", total - fail - g_skipped, total, (fail || g_skipped) ? "FAILED" : "PASS", g_skipped);
     ggml_backend_free(g_gpu);
-    return fail ? 1 : 0;
+    return (fail || g_skipped) ? 1 : 0;
 }

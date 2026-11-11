@@ -1,3 +1,6 @@
+#include <array>
+#include <map>
+#include <mutex>
 #include "models.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
@@ -1130,8 +1133,8 @@ static int64_t qsa_rdna2_min_kv() {
 }
 
 // does a GPU backend run the flash attention of this compact mask? asked with the node, as the scheduler will
-static bool qsa_rdna2_gpu_supports(ggml_context * ctx0, int64_t n_head, int64_t n_head_kv, int64_t D, int64_t n_sel, int64_t n_t,
-                                   int64_t n_kv_probe, ggml_type type_k, ggml_type type_v) {
+static bool qsa_rdna2_gpu_supports_uncached(ggml_context * ctx0, int64_t n_head, int64_t n_head_kv, int64_t D, int64_t n_sel, int64_t n_t,
+                                            int64_t n_kv_probe, ggml_type type_k, ggml_type type_v) {
     ggml_tensor * q    = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, n_t, n_head, 1);
     ggml_tensor * k    = ggml_new_tensor_4d(ctx0, type_k, D, n_kv_probe, n_head_kv, 1);
     ggml_tensor * v    = ggml_new_tensor_4d(ctx0, type_v, D, n_kv_probe, n_head_kv, 1);
@@ -1148,6 +1151,23 @@ static bool qsa_rdna2_gpu_supports(ggml_context * ctx0, int64_t n_head, int64_t 
         }
     }
     return false;
+}
+
+// the answer depends only on the shapes/types, and the backend set is fixed for the process: ask once per shape set
+// (the probe tensors cost graph metadata in every layer's context otherwise)
+static bool qsa_rdna2_gpu_supports(ggml_context * ctx0, int64_t n_head, int64_t n_head_kv, int64_t D, int64_t n_sel, int64_t n_t,
+                                   int64_t n_kv_probe, ggml_type type_k, ggml_type type_v) {
+    static std::mutex mtx;
+    static std::map<std::array<int64_t, 8>, bool> cache;
+    const std::array<int64_t, 8> key = { n_head, n_head_kv, D, n_sel, n_t, n_kv_probe, (int64_t) type_k, (int64_t) type_v };
+    std::lock_guard<std::mutex> lock(mtx);
+    const auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+    const bool r = qsa_rdna2_gpu_supports_uncached(ctx0, n_head, n_head_kv, D, n_sel, n_t, n_kv_probe, type_k, type_v);
+    cache.emplace(key, r);
+    return r;
 }
 
 // the blocks this ubatch completes or regroups, re-pooled into the cache

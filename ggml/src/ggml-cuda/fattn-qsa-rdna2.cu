@@ -42,7 +42,7 @@ static __device__ __forceinline__ void qsa_r2_load_q(half2 * q, const char * src
     }
 }
 
-template <typename TQ>
+template <typename TQ, bool HP>
 __launch_bounds__(QSA_R2_NT)
 static __global__ void k_fattn_qsa_rdna2(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
@@ -69,10 +69,21 @@ static __global__ void k_fattn_qsa_rdna2(
     const int h0   = blockIdx.y * QSA_R2_HG;      // first of its 4 query heads
     const int kvh  = h0 / gqa;
 
-    half2 qreg[QSA_R2_HG][16];
+    // HP (validation reference only, LLAMA_QSA_RDNA2_FP32=1): Q kept in FP32 and K dequantized + accumulated in FP32
+    half2 qreg[HP ? 1 : QSA_R2_HG][HP ? 1 : 16];
+    float qf[HP ? QSA_R2_HG : 1][HP ? 32 : 1];
 #pragma unroll
     for (int hh = 0; hh < QSA_R2_HG; ++hh) {
-        qsa_r2_load_q<TQ>(qreg[hh], Q + q*q_nb1 + (int64_t) (h0 + hh)*q_nb2 + (int64_t) (32*w)*sizeof(TQ));
+        const char * qsrc = Q + q*q_nb1 + (int64_t) (h0 + hh)*q_nb2 + (int64_t) (32*w)*sizeof(TQ);
+        if constexpr (HP) {
+#pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                if constexpr (std::is_same<TQ, float>::value) { qf[hh][i] = ((const float *) qsrc)[i]; }
+                else                                          { qf[hh][i] = __half2float(((const half *) qsrc)[i]); }
+            }
+        } else {
+            qsa_r2_load_q<TQ>(qreg[hh], qsrc);
+        }
     }
 
     const char * k_head = K + (int64_t) kvh*k_nb2;
@@ -135,18 +146,35 @@ static __global__ void k_fattn_qsa_rdna2(
         }
         __syncthreads();
 
-        // partial scores of the quant block w: lane = slot
+        // partial scores of the quant block w: lane = slot. Dead slots never touch sK (never written this step):
+        // their partial is exactly 0 and the softmax masks them anyway.
         {
-            const uint16_t * kb = (const uint16_t *) ((const char *) sK + (lane*QSA_R2_KS)*4 + w*sizeof(block_q8_0));
-            const half2 dd = __half2half2(__ushort_as_half(kb[0]));
             float s[QSA_R2_HG] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if ((live >> lane) & 1) {
+                const uint16_t * kb = (const uint16_t *) ((const char *) sK + (lane*QSA_R2_KS)*4 + w*sizeof(block_q8_0));
+                if constexpr (HP) {
+                    const float d = __half2float(__ushort_as_half(kb[0]));
 #pragma unroll
-            for (int k = 0; k < 16; ++k) {
-                const uint32_t u = kb[1 + k];
-                const half2 kv = __hmul2(dd, __halves2half2(__int2half_rn((int8_t) (u & 0xff)), __int2half_rn((int8_t) (u >> 8))));
+                    for (int k = 0; k < 16; ++k) {
+                        const uint32_t u = kb[1 + k];
+                        const float k0 = d*(float) (int8_t) (u & 0xff);
+                        const float k1 = d*(float) (int8_t) (u >> 8);
 #pragma unroll
-                for (int hh = 0; hh < QSA_R2_HG; ++hh) {
-                    ggml_cuda_mad(s[hh], kv, qreg[hh][k]);
+                        for (int hh = 0; hh < QSA_R2_HG; ++hh) {
+                            s[hh] = fmaf(k0, qf[hh][2*k], fmaf(k1, qf[hh][2*k + 1], s[hh]));
+                        }
+                    }
+                } else {
+                    const half2 dd = __half2half2(__ushort_as_half(kb[0]));
+#pragma unroll
+                    for (int k = 0; k < 16; ++k) {
+                        const uint32_t u = kb[1 + k];
+                        const half2 kv = __hmul2(dd, __halves2half2(__int2half_rn((int8_t) (u & 0xff)), __int2half_rn((int8_t) (u >> 8))));
+#pragma unroll
+                        for (int hh = 0; hh < QSA_R2_HG; ++hh) {
+                            ggml_cuda_mad(s[hh], kv, qreg[hh][k]);
+                        }
+                    }
                 }
             }
 #pragma unroll
@@ -267,7 +295,7 @@ bool ggml_cuda_flash_attn_ext_qsa_rdna2_supported(int device, const ggml_tensor 
 #endif
 }
 
-template <typename TQ>
+template <typename TQ, bool HP>
 static void qsa_r2_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -278,7 +306,7 @@ static void qsa_r2_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     memcpy(&scale, dst->op_params, sizeof(float));
     const int gqa = (int) (Q->ne[2] / K->ne[2]);
     const dim3 grid((unsigned) Q->ne[1], (unsigned) (Q->ne[2] / QSA_R2_HG), 1);
-    k_fattn_qsa_rdna2<TQ><<<grid, QSA_R2_NT, 0, ctx.stream()>>>(
+    k_fattn_qsa_rdna2<TQ, HP><<<grid, QSA_R2_NT, 0, ctx.stream()>>>(
         (const char *) Q->data, (const char *) K->data, (const char *) V->data,
         (const half *) mask->data, (const int32_t *) idx->data, (char *) dst->data,
         (int) idx->ne[0], K->ne[1], scale, gqa,
@@ -289,9 +317,11 @@ static void qsa_r2_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 void ggml_cuda_flash_attn_ext_qsa_rdna2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(ggml_cuda_flash_attn_ext_qsa_rdna2_supported(ctx.device, dst));
+    // validation switch: FP32 reference arithmetic (slower), read once
+    static const bool hp = getenv("LLAMA_QSA_RDNA2_FP32") != nullptr && atoi(getenv("LLAMA_QSA_RDNA2_FP32")) != 0;
     if (dst->src[0]->type == GGML_TYPE_F32) {
-        qsa_r2_launch<float>(ctx, dst);
+        if (hp) { qsa_r2_launch<float, true>(ctx, dst); } else { qsa_r2_launch<float, false>(ctx, dst); }
     } else {
-        qsa_r2_launch<half>(ctx, dst);
+        if (hp) { qsa_r2_launch<half, true>(ctx, dst); } else { qsa_r2_launch<half, false>(ctx, dst); }
     }
 }
