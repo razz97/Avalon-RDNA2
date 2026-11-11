@@ -12,7 +12,7 @@ for d in map(pathlib.Path, sys.argv[1:]):
         m = re.search(p, log); return m.groups() if m else None
     comp = g(r'prompt compute buffer: ([\d.]+) MiB at (\d+) tokens')
     cap = g(r'capacity: policy=\S+ granted=(\d+) MiB free=(\d+) MiB reserve=(\d+) MiB')
-    ev = [json.loads(l) for l in (d / 'events-0.jsonl').read_text().splitlines() if l.strip()]
+    ev = [json.loads(l) for l in (d / 'events-0.jsonl').read_text().splitlines() if l.strip()] if (d / 'events-0.jsonl').exists() else []
     toks = [e['event'].get('tokens', [None])[0] for e in ev if 'event' in e and e['event'].get('tokens')]
     minfree = peak = None
     try:
