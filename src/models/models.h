@@ -2635,6 +2635,9 @@ struct llama_model_qwen4exp : public llama_model_base {
             // (LLAMA_QSA_ATT_SLICE): neither the mask nor the query side is ever alive for the whole batch
             std::function<ggml_tensor * (int64_t t0, int64_t n)> tiles_slice;
             int64_t n_att_slice = 0;
+            // or (LLAMA_QSA_RDNA2_PREFILL=1, gfx1030) the compact mask F16 [n_sel, n_tokens] of GGML_QSA_SELECT_RDNA2_PREFILL: the
+            // flash attention of all the queries reads K/V in place at the cells of its sources[5] (the selection), no gather
+            ggml_tensor * sparse_prefill_mask = nullptr;
         };
 
         // a QSA layer of a prompt batch by slices of queries (qsa_sel::tiles_slice)
@@ -2673,7 +2676,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * kq_mask,
                             int * sections,
                             int   il,
-                           bool   store_only = false);
+                           bool   store_only = false,
+  const llama_kv_cache_context * mctx_attn = nullptr);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,

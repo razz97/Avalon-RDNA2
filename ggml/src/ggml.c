@@ -5656,6 +5656,10 @@ struct ggml_tensor * ggml_flash_attn_ext(
     if (mask && mask->op == GGML_OP_QSA_SELECT && ggml_get_op_params_i32(mask, 1) == GGML_QSA_SELECT_TILE_MASK) {
         result->src[5] = mask->src[4];
     }
+    // the compact mask of the RDNA2 sparse prefill names the cell of each slot: sel is read by the attention, src[5] keeps it alive
+    if (mask && mask->op == GGML_OP_QSA_SELECT && ggml_get_op_params_i32(mask, 1) == GGML_QSA_SELECT_RDNA2_PREFILL) {
+        result->src[5] = mask->src[0];
+    }
 
     return result;
 }
@@ -6588,7 +6592,8 @@ struct ggml_tensor * ggml_qsa_select(
     struct ggml_tensor * result;
     switch (mode) {
         case GGML_QSA_SELECT_ROWS: result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, sel->ne[0], n_t); break;
-        case GGML_QSA_SELECT_MASK: result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, sel->ne[0], n_t); break;
+        case GGML_QSA_SELECT_MASK:
+        case GGML_QSA_SELECT_RDNA2_PREFILL: result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, sel->ne[0], n_t); break;
         default:                   result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, vis->ne[0], n_t); break;
     }
 

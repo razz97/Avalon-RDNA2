@@ -300,7 +300,11 @@ static void qsa_select_tiles(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 }
 
 void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const int32_t mode   = ggml_get_op_params_i32(dst, 1);
+    int32_t mode   = ggml_get_op_params_i32(dst, 1);
+    // the compact mask of the RDNA2 sparse prefill is the MASK mode (its value is above the tile modes': normalize first)
+    if (mode == GGML_QSA_SELECT_RDNA2_PREFILL) {
+        mode = GGML_QSA_SELECT_MASK;
+    }
     if (mode >= GGML_QSA_SELECT_TILE_ROWS) {
         qsa_select_tiles(ctx, dst);
         return;

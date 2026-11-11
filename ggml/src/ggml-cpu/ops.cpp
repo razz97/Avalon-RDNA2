@@ -12752,11 +12752,13 @@ void ggml_compute_forward_qsa_select(const ggml_compute_params * params, ggml_te
     if (params->ith != 0) {
         return;
     }
-    if (ggml_get_op_params_i32(dst, 1) >= GGML_QSA_SELECT_TILE_ROWS) {
+    // the RDNA2 prefill's compact mask is the MASK mode (its value is above the tile modes')
+    const int32_t mode_raw = ggml_get_op_params_i32(dst, 1);
+    if (mode_raw != GGML_QSA_SELECT_RDNA2_PREFILL && mode_raw >= GGML_QSA_SELECT_TILE_ROWS) {
         ggml_compute_forward_qsa_select_tiles(dst);
         return;
     }
-    if (ggml_get_op_params_i32(dst, 1) >= GGML_QSA_SELECT_POOL_MEMBERS) {
+    if (mode_raw != GGML_QSA_SELECT_RDNA2_PREFILL && mode_raw >= GGML_QSA_SELECT_POOL_MEMBERS) {
         ggml_compute_forward_qsa_pool_layout(dst);
         return;
     }
@@ -12765,7 +12767,7 @@ void ggml_compute_forward_qsa_select(const ggml_compute_params * params, ggml_te
     const ggml_tensor * vis       = dst->src[2];
     const ggml_tensor * tok_pos   = dst->src[3];
     const int32_t kpool  = ggml_get_op_params_i32(dst, 0);
-    const int32_t mode   = ggml_get_op_params_i32(dst, 1);
+    const int32_t mode   = mode_raw == GGML_QSA_SELECT_RDNA2_PREFILL ? (int32_t) GGML_QSA_SELECT_MASK : mode_raw;
     const bool    by_pos = vis->type == GGML_TYPE_I32;
     const int64_t n_kv   = vis->ne[0];
     const int64_t n_t    = dst->ne[1];
