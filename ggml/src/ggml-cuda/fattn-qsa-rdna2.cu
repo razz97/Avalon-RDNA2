@@ -302,6 +302,10 @@ static void qsa_r2_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * idx  = dst->src[5];
+    // the shape/stride conditions are checked by _supported(); the pointers only exist now: the kernel reads K/V rows as
+    // 4-byte words, Q as 16-byte vectors, mask as halves, indices as ints
+    GGML_ASSERT(((uintptr_t) K->data & 3) == 0 && ((uintptr_t) V->data & 3) == 0 && ((uintptr_t) Q->data & 15) == 0 &&
+                ((uintptr_t) mask->data & 1) == 0 && ((uintptr_t) idx->data & 3) == 0 && ((uintptr_t) dst->data & 3) == 0);
     float scale;
     memcpy(&scale, dst->op_params, sizeof(float));
     const int gqa = (int) (Q->ne[2] / K->ne[2]);
