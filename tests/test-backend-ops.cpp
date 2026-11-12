@@ -64,12 +64,21 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         constexpr int patterns = 16;
         const int64_t width = tensor->ne[0];
         const size_t row_bytes = ggml_row_size(tensor->type, width);
-        std::vector<float> rows(patterns * width), importance(width, 1.0f);
-        std::default_random_engine gen(0x2744u);
-        std::uniform_real_distribution<float> dist(min, max);
-        for (auto & value : rows) value = dist(gen);
         std::vector<uint8_t> quant(patterns * row_bytes), dataq(ggml_nbytes(tensor));
-        ggml_quantize_chunk(tensor->type, rows.data(), quant.data(), 0, patterns, width, importance.data());
+        if (const char * dir = getenv("AVALON_TEST_PATTERN_REPLAY_DIR")) {
+            char path[4096];
+            snprintf(path, sizeof(path), "%s/pattern-%s-%lld.qbin", dir, ggml_type_name(tensor->type), (long long) width);
+            FILE * f = fopen(path, "rb");
+            GGML_ASSERT(f && fread(quant.data(), 1, quant.size(), f) == quant.size());
+            GGML_ASSERT(fgetc(f) == EOF && fclose(f) == 0);
+            fprintf(stderr, "MMQ_REPLAY quantized_patterns=%s bytes=%zu\n", path, quant.size());
+        } else {
+            std::vector<float> rows(patterns * width), importance(width, 1.0f);
+            std::default_random_engine gen(0x2744u);
+            std::uniform_real_distribution<float> dist(min, max);
+            for (auto & value : rows) value = dist(gen);
+            ggml_quantize_chunk(tensor->type, rows.data(), quant.data(), 0, patterns, width, importance.data());
+        }
         if (const char * dir = getenv("AVALON_TEST_CAPTURE_DIR")) {
             char path[4096];
             snprintf(path, sizeof(path), "%s/pattern-%s-%lld.f32", dir, ggml_type_name(tensor->type), (long long) width);
@@ -1750,14 +1759,25 @@ struct test_case {
             char cmd[32];
             while (fgets(cmd, sizeof(cmd), stdin)) {
                 if (cmd[0] == 'Q') break;
+                if (cmd[0] == 'D' && getenv("AVALON_TEST_POST_DUMP")) {
+                    ggml_backend_synchronize(backend);
+                    std::vector<uint8_t> bytes(ggml_nbytes(out));
+                    ggml_backend_tensor_get(out, bytes.data(), 0, bytes.size());
+                    FILE * f = fopen(getenv("AVALON_TEST_POST_DUMP"), "wb");
+                    if (!f || fwrite(bytes.data(), 1, bytes.size(), f) != bytes.size() || fclose(f) != 0) return false;
+                    printf("MMQ_DUMPED %zu\n", bytes.size()); fflush(stdout);
+                    continue;
+                }
                 if (cmd[0] != 'W' && cmd[0] != 'M') return false;
+                const int64_t host_start = ggml_time_us();
                 if (cmd[0] == 'M') ggml_backend_event_record(&start, backend);
                 if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) return false;
                 if (cmd[0] == 'M') {
                     ggml_backend_event_record(&stop, backend);
                     float ms = 0;
                     if (sync(b) || elapsed(&ms, a, b)) return false;
-                    printf("MMQ_MS %.6f\n", ms);
+                    const double host_ms = (ggml_time_us() - host_start) / 1000.0;
+                    printf("MMQ_MS %.6f HOST_MS %.6f\n", ms, host_ms);
                 } else printf("MMQ_WARM\n");
                 fflush(stdout);
             }
@@ -8949,6 +8969,20 @@ struct test_moe_block : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         std::default_random_engine rng(4321);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (const char * dir = getenv("AVALON_TEST_REPLAY_DIR")) {
+                if (strcmp(t->name, "moe_x") == 0 || strcmp(t->name, "moe_ids") == 0) {
+                    const size_t n = ggml_nbytes(t);
+                    std::vector<uint8_t> data(n);
+                    char path[4096];
+                    snprintf(path, sizeof(path), "%s/%s.bin", dir, t->name);
+                    FILE * f = fopen(path, "rb");
+                    GGML_ASSERT(f && fread(data.data(), 1, n, f) == n);
+                    GGML_ASSERT(fgetc(f) == EOF && fclose(f) == 0);
+                    ggml_backend_tensor_set(t, data.data(), 0, n);
+                    fprintf(stderr, "MMQ_REPLAY input=%s bytes=%zu\n", path, n);
+                    continue;
+                }
+            }
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
                 std::vector<int32_t> perm(n_mats);
@@ -12804,6 +12838,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6, 4096, 5120, {1, 1}, {1, 1}));
+    // qwen4exp dense Q8_0 with 3 columns (MTP verification): the shapes seen in a decode trace
+    for (int64_t mk : {16480, 2560}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk, 3, mk == 16480 ? 2560 : 6144, {1, 1}, {1, 1}));
+    }
 
     // SIMD K boundaries, including tails shorter than one vector.
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
@@ -14363,6 +14401,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // Q4_K multi-column mat-vec
+    // qwen4exp dense Q8_0 with 3 columns (MTP verification): the shapes seen in a decode trace
+    for (int64_t mk : {16480, 2560}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk, 3, mk == 16480 ? 2560 : 6144, {1, 1}, {1, 1}));
+    }
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, bs, 4096, {1, 1}, {1, 1}));

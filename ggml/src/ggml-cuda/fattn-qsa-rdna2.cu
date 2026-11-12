@@ -1,4 +1,5 @@
 #include "fattn-qsa-rdna2.cuh"
+#include <atomic>
 
 // One CTA = one query x one group of 4 query heads of a KV head, 256 threads (8 waves of 32), 32 selected slots per step,
 // online softmax in FP32 in registers/LDS (no split-K, no global scratch).
@@ -326,6 +327,16 @@ void ggml_cuda_flash_attn_ext_qsa_rdna2(ggml_backend_cuda_context & ctx, ggml_te
     GGML_ASSERT(ggml_cuda_flash_attn_ext_qsa_rdna2_supported(ctx.device, dst));
     // validation switch: FP32 reference arithmetic (slower), read once
     static const bool hp = getenv("LLAMA_QSA_RDNA2_FP32") != nullptr && atoi(getenv("LLAMA_QSA_RDNA2_FP32")) != 0;
+    // opt-in dispatch evidence (AVALON_RDNA2_DISPATCH_LOG=1): host-side launcher entries, not GPU completion
+    static const bool log_dispatch = getenv("AVALON_RDNA2_DISPATCH_LOG") && atoi(getenv("AVALON_RDNA2_DISPATCH_LOG")) != 0;
+    if (log_dispatch) {
+        static std::atomic<long> calls{0};
+        const long c = ++calls;
+        if (c <= 2 || c % 32 == 0) {
+            GGML_LOG_INFO("QSA_DISPATCH rdna2 sparse flash attention n_q=%lld n_kv=%lld n_sel=%lld calls=%ld\n",
+                (long long) dst->src[0]->ne[1], (long long) dst->src[1]->ne[1], (long long) dst->src[3]->ne[0], c);
+        }
+    }
     if (dst->src[0]->type == GGML_TYPE_F32) {
         if (hp) { qsa_r2_launch<float, true>(ctx, dst); } else { qsa_r2_launch<float, false>(ctx, dst); }
     } else {

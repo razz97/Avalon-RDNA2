@@ -44,6 +44,10 @@ static __global__ void k_mmq_tile_prefix_groups(const int32_t * __restrict__ bou
 #include "ggml-backend-impl.h"
 
 #include <cstdint>
+#include <atomic>
+#include <map>
+#include <mutex>
+#include <string>
 #include <functional>
 #include <cstring>
 #include <limits>
@@ -58,7 +62,7 @@ static bool rdna2_mmq_avg_cols(int cc, int64_t n_tok, int64_t n_used, int64_t n_
         const char * flag = getenv("AVALON_RDNA2_MMQ_AVG_TOKENS");
         return flag && atoi(flag) != 0;
     }();
-    if (!enabled || n_tok <= 0 || n_used <= 0 || n_expert <= 0 ||
+    if (!enabled || n_tok <= 0 || n_used <= 0 || n_expert <= 0 || n_used > n_expert ||
             n_tok > std::numeric_limits<int64_t>::max() / n_used) {
         return false;
     }
@@ -919,9 +923,48 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
     } else {
         (void) rdna2_mmq_avg_cols(cc, n_tok, n_used, n_expert, ncols_opt);
     }
-    const int J_gu = mmq_pick_J(wg->type, ncols_opt, fb_gu, cc, smpbo, GGML_PREC_Q8);
-    const int J_d  = mmq_pick_J(wd->type, ncols_opt, fb_d,  cc, smpbo, GGML_PREC_Q8, dsum);
+    int J_gu = mmq_pick_J(wg->type, ncols_opt, fb_gu, cc, smpbo, GGML_PREC_Q8);
+    int J_d  = mmq_pick_J(wd->type, ncols_opt, fb_d,  cc, smpbo, GGML_PREC_Q8, dsum);
     GGML_ASSERT(J_gu > 0 && J_d > 0);
+    // Opt-in diagnostic only, restricted to gfx1030 grouped execution. Reject
+    // unsupported specializations and LDS requirements rather than guessing.
+    if (cc == GGML_CUDA_CC_RDNA2 && n_tok > 0 && n_used > 0 && n_expert > 0 &&
+            n_used <= n_expert && n_tok <= std::numeric_limits<int64_t>::max() / n_used) {
+        const char * forced = getenv("AVALON_RDNA2_MMQ_GROUPED_J");
+        if (forced && (!strcmp(forced, "40") || !strcmp(forced, "48") || !strcmp(forced, "64"))) {
+            const int j = atoi(forced);
+            const auto cg = ggml_cuda_mmq_get_config(wg->type, j, fb_gu, cc, GGML_PREC_Q8);
+            const auto cd = ggml_cuda_mmq_get_config(wd->type, j, fb_d, cc, GGML_PREC_Q8);
+            if (cg.type == wg->type && cg.J == j && cd.type == wd->type && cd.J == j &&
+                    mmq_get_nbytes_shared(cg, cc, false) <= smpbo && mmq_get_nbytes_shared(cd, cc, dsum) <= smpbo) {
+                J_gu = J_d = j;
+                static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+                if (!logged.test_and_set(std::memory_order_relaxed)) {
+                    GGML_LOG_INFO("MMQ_EXPERIMENT grouped gfx1030 forced J_gu=%d J_d=%d types=%s/%s LDS=%zu/%zu\n",
+                        J_gu, J_d, ggml_type_name(wg->type), ggml_type_name(wd->type),
+                        mmq_get_nbytes_shared(cg, cc, false), mmq_get_nbytes_shared(cd, cc, dsum));
+                }
+            }
+        }
+    }
+
+    // Opt-in dispatch evidence (AVALON_RDNA2_DISPATCH_LOG=1): one line per distinct shape/type/J, then every 64th call
+    {
+        static const bool log_j = getenv("AVALON_RDNA2_DISPATCH_LOG") && atoi(getenv("AVALON_RDNA2_DISPATCH_LOG")) != 0;
+        if (log_j) {
+            static std::mutex log_mu;
+            static std::map<std::string, long> seen;
+            char key[192];
+            snprintf(key, sizeof(key), "n_tok=%lld n_used=%lld n_expert=%lld G=%d types=%s/%s/%s J_gu=%d J_d=%d",
+                (long long) n_tok, (long long) n_used, (long long) n_expert, G, ggml_type_name(wg->type), ggml_type_name(wu->type),
+                ggml_type_name(wd->type), J_gu, J_d);
+            std::lock_guard<std::mutex> lk(log_mu);
+            const long c = ++seen[key];
+            if (c == 1 || c % 64 == 0) {
+                GGML_LOG_INFO("MMQ_DISPATCH grouped %s cc=%d calls=%ld\n", key, cc, c);
+            }
+        }
+    }
 
     // the scratch the scheduler placed in the compute buffer for gate (its ids and its quantized activation, shared with
     // up) and for down (its quantized activation), as the ungrouped products use it; else pool memory
@@ -1073,6 +1116,21 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         GGML_UNUSED(fallback);
         ggml_cuda_mul_mat_q_switch_type(ctx, a, ls, GGML_PREC_Q8);
     };
+    // A separate opt-in diagnostic pass: event pairs surround only MMQ launch
+    // windows. Never enable for the uninstrumented full-graph timing runs.
+    const bool prof_mmq = cc == GGML_CUDA_CC_RDNA2 && !two &&
+        getenv("AVALON_RDNA2_MMQ_PROFILE_EVENTS") && atoi(getenv("AVALON_RDNA2_MMQ_PROFILE_EVENTS")) != 0;
+    struct mmq_profile_pair { cudaEvent_t begin, end; int role; };
+    std::vector<mmq_profile_pair> prof;
+    auto profile_begin = [&](int role, cudaStream_t s) {
+        if (!prof_mmq) return;
+        mmq_profile_pair p{}; p.role = role;
+        CUDA_CHECK(cudaEventCreateWithFlags(&p.begin, 0)); CUDA_CHECK(cudaEventCreateWithFlags(&p.end, 0));
+        CUDA_CHECK(cudaEventRecord(p.begin, s)); prof.push_back(p);
+    };
+    auto profile_end = [&](cudaStream_t s) {
+        if (prof_mmq) CUDA_CHECK(cudaEventRecord(prof.back().end, s));
+    };
     bool first_launch = true;
     for (int64_t g0 = 0; g0 < n_expert; g0 += G) {
         const int r0 = hb[g0], r1 = hb[g0 + G];
@@ -1094,10 +1152,12 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
             }
             continue;
         }
+        profile_begin(0, sg);
         launch(wg, gate, q8_gu.get(), ne10p_gu, 1, J_gu, fb_gu, g0, r0, r1, 0, sg);
         if (!pair_ok) {
             launch(wu, up,   q8_gu.get(), ne10p_gu, 1, J_gu, fb_gu, g0, r0, r1, 1, sg);
         }
+        profile_end(sg);
         {
             const dim3 grid((unsigned) std::min<int64_t>((n_ff + 255)/256, 8), (unsigned) (r1 - r0));
             k_moe_grouped_swiglu<<<grid, 256, 0, sg>>>((const float *) gate->data, (const float *) up->data, (float *) glu->data,
@@ -1105,10 +1165,23 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         }
         quantize_mmq_q8_1_rows_cuda((const float *) glu->data, ids_dst.get(), q8_d.get(), wd->type, n_ff,
             glu->nb[1]/sizeof(float), ne10p_d, r0, r1 - r0, (int) rows, sg);
+        profile_begin(1, sg);
         launch(wd, down, q8_d.get(), ne10p_d, n_used, J_d, fb_d, g0, r0, r1, 2, sg, dsum);
+        profile_end(sg);
         if (hooks && hooks->after) {
             (*hooks->after)(g0 / G);
         }
+    }
+    if (!prof.empty()) {
+        CUDA_CHECK(cudaEventSynchronize(prof.back().end));
+        double gu_ms = 0, down_ms = 0;
+        for (auto & p : prof) {
+            float ms = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, p.begin, p.end));
+            (p.role == 0 ? gu_ms : down_ms) += ms;
+            CUDA_CHECK(cudaEventDestroy(p.begin)); CUDA_CHECK(cudaEventDestroy(p.end));
+        }
+        GGML_LOG_INFO("MMQ_PROFILE event windows groups=%zu gate_up_ms=%.6f down_ms=%.6f\n", prof.size() / 2, gu_ms, down_ms);
     }
     if (two) {   // the second stream's groups joined into the block's stream
         CUDA_CHECK(cudaEventRecord(ev_join[ctx.device], gs[1]));
