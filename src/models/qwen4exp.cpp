@@ -1118,7 +1118,7 @@ static int32_t qsa_tile_cols() {
     return n;
 }
 
-// LLAMA_QSA_RDNA2_PREFILL=1 (default 0): the prefill of QSA layers from LLAMA_QSA_RDNA2_MIN_KV cells (default 32768) runs the
+// LLAMA_QSA_RDNA2_PREFILL=1 (default 0): the prefill of QSA layers from LLAMA_QSA_RDNA2_MIN_KV cells (default 20480) runs the
 // native sparse flash attention of gfx1030 (ggml-cuda/fattn-qsa-rdna2.cu), which reads the quantized K/V in place at the cells of
 // each query's selection, by a compact mask [n_sel, n_t]. Where it does not apply the attention is the dense slices: the tile
 // path (needs WMMA, absent on gfx1030) is not used while the feature is on
@@ -1128,7 +1128,7 @@ static bool qsa_rdna2_prefill_on() {
 }
 
 static int64_t qsa_rdna2_min_kv() {
-    static const int64_t n = [] { const char * e = getenv("LLAMA_QSA_RDNA2_MIN_KV"); return e && atoll(e) > 0 ? (int64_t) atoll(e) : (int64_t) 32768; }();
+    static const int64_t n = [] { const char * e = getenv("LLAMA_QSA_RDNA2_MIN_KV"); return e && atoll(e) > 0 ? (int64_t) atoll(e) : (int64_t) 20480; }();
     return n;
 }
 
