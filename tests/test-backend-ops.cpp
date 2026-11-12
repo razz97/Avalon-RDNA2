@@ -19,6 +19,8 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "../ggml/src/ggml-backend-impl.h" // temporary isolated HIP-event harness
+#include <dlfcn.h>
 
 #include <algorithm>
 #include <numeric>
@@ -58,13 +60,41 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     }
 
     size_t nels = ggml_nelements(tensor);
+    if (getenv("AVALON_TEST_PATTERN") && ggml_is_quantized(tensor->type)) {
+        constexpr int patterns = 16;
+        const int64_t width = tensor->ne[0];
+        const size_t row_bytes = ggml_row_size(tensor->type, width);
+        std::vector<float> rows(patterns * width), importance(width, 1.0f);
+        std::default_random_engine gen(0x2744u);
+        std::uniform_real_distribution<float> dist(min, max);
+        for (auto & value : rows) value = dist(gen);
+        std::vector<uint8_t> quant(patterns * row_bytes), dataq(ggml_nbytes(tensor));
+        ggml_quantize_chunk(tensor->type, rows.data(), quant.data(), 0, patterns, width, importance.data());
+        if (const char * dir = getenv("AVALON_TEST_CAPTURE_DIR")) {
+            char path[4096];
+            snprintf(path, sizeof(path), "%s/pattern-%s-%lld.f32", dir, ggml_type_name(tensor->type), (long long) width);
+            std::vector<float> dequant(patterns * width);
+            const auto * trait = ggml_get_type_traits(tensor->type);
+            GGML_ASSERT(trait->to_float);
+            for (int i = 0; i < patterns; ++i) trait->to_float(quant.data() + i * row_bytes, dequant.data() + i * width, width);
+            FILE * f = fopen(path, "wb");
+            GGML_ASSERT(f && fwrite(dequant.data(), sizeof(float), dequant.size(), f) == dequant.size());
+            GGML_ASSERT(fclose(f) == 0);
+        }
+        for (size_t row = 0; row < nels / width; ++row) {
+            size_t pattern = (row + row / tensor->ne[1]) % patterns;
+            memcpy(dataq.data() + row * row_bytes, quant.data() + pattern * row_bytes, row_bytes);
+        }
+        ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
+        return;
+    }
     std::vector<float> data(nels);
     {
         // parallel initialization
         static const size_t n_threads = std::max<size_t>(1, std::min<size_t>(nels/1024, std::min<size_t>(4, N_THREADS/2)));
 
         auto init_thread = [&](size_t start, size_t end) {
-            thread_local std::default_random_engine gen(std::random_device{}());
+            std::default_random_engine gen(0x2744u + static_cast<unsigned int>(start));
             std::uniform_real_distribution<float> distribution(min, max);
             for (size_t i = start; i < end; i++) {
                 data[i] = distribution(gen);
@@ -1673,6 +1703,68 @@ struct test_case {
             fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
             return false;
         }
+        if (const char * path = getenv("AVALON_TEST_SAMPLE")) {
+            GGML_ASSERT(out->type == GGML_TYPE_F32 && out->ne[2] == 2048);
+            ggml_backend_synchronize(backend);
+            const size_t token_bytes = out->ne[0] * out->ne[1] * sizeof(float);
+            std::vector<uint8_t> bytes(4 * token_bytes);
+            const int indices[] = {0, 1, 2, 2047};
+            for (int j=0; j<4; ++j) ggml_backend_tensor_get(out, bytes.data()+j*token_bytes, indices[j]*out->nb[2], token_bytes);
+            FILE * f = fopen(path, "wb");
+            if (!f || fwrite(bytes.data(), 1, bytes.size(), f) != bytes.size() || fclose(f) != 0) return false;
+            return true;
+        }
+        if (const char * path = getenv("AVALON_TEST_DUMP")) {
+            ggml_backend_synchronize(backend);
+            std::vector<uint8_t> bytes(ggml_nbytes(out));
+            ggml_backend_tensor_get(out, bytes.data(), 0, bytes.size());
+            FILE * f = fopen(path, "wb");
+            if (!f || fwrite(bytes.data(), 1, bytes.size(), f) != bytes.size() || fclose(f) != 0) {
+                fprintf(stderr, "dump failed\n");
+                return false;
+            }
+            if (getenv("AVALON_TEST_DUMP_ONLY")) {
+                return true;
+            }
+        }
+
+        if (getenv("AVALON_TEST_HIP_EVENTS")) {
+            GGML_ASSERT(getenv("GGML_CUDA_DISABLE_GRAPHS") && getenv("GGML_CUDA_MOE_GROUPED"));
+            GGML_ASSERT(!getenv("GGML_CUDA_MOE_GROUPED_STREAMS") || atoi(getenv("GGML_CUDA_MOE_GROUPED_STREAMS")) == 1);
+            void * lib = dlopen("libamdhip64.so", RTLD_NOW | RTLD_LOCAL);
+            if (!lib) { fprintf(stderr, "hip dlopen: %s\n", dlerror()); return false; }
+            using create_t = int (*)(void **);
+            using sync_t = int (*)(void *);
+            using elapsed_t = int (*)(float *, void *, void *);
+            using destroy_t = int (*)(void *);
+            auto create = reinterpret_cast<create_t>(dlsym(lib, "hipEventCreate"));
+            auto sync = reinterpret_cast<sync_t>(dlsym(lib, "hipEventSynchronize"));
+            auto elapsed = reinterpret_cast<elapsed_t>(dlsym(lib, "hipEventElapsedTime"));
+            auto destroy = reinterpret_cast<destroy_t>(dlsym(lib, "hipEventDestroy"));
+            if (!create || !sync || !elapsed || !destroy) return false;
+            void * a = nullptr, * b = nullptr;
+            if (create(&a) || create(&b)) return false;
+            ggml_backend_event start{ggml_backend_get_device(backend), a};
+            ggml_backend_event stop{ggml_backend_get_device(backend), b};
+            printf("MMQ_READY\n"); fflush(stdout);
+            char cmd[32];
+            while (fgets(cmd, sizeof(cmd), stdin)) {
+                if (cmd[0] == 'Q') break;
+                if (cmd[0] != 'W' && cmd[0] != 'M') return false;
+                if (cmd[0] == 'M') ggml_backend_event_record(&start, backend);
+                if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) return false;
+                if (cmd[0] == 'M') {
+                    ggml_backend_event_record(&stop, backend);
+                    float ms = 0;
+                    if (sync(b) || elapsed(&ms, a, b)) return false;
+                    printf("MMQ_MS %.6f\n", ms);
+                } else printf("MMQ_WARM\n");
+                fflush(stdout);
+            }
+            if (destroy(a) || destroy(b)) return false;
+            dlclose(lib);
+            return true;
+        }
 
         // determine number of runs
         int n_runs;
@@ -1693,6 +1785,9 @@ struct test_case {
             n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
         }
 
+        if (run_whole_graph()) {
+            n_runs = 1; // time the complete graph, not duplicated final down nodes
+        }
         // duplicate the op
         for (int i = 1; i < n_runs; i++) {
             ggml_graph_add_node(gf, out);
@@ -8841,6 +8936,8 @@ struct test_moe_block : public test_case {
         ggml_tensor * down = ggml_new_tensor_3d(ctx, type_d,  n_ff, n_embd, n_mats);
         ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tok);
         ggml_tensor * x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tok);
+        ggml_set_name(ids, "moe_ids");
+        ggml_set_name(x, "moe_x");
         ggml_tensor * g    = ggml_mul_mat_id(ctx, gate, x, ids);
         ggml_tensor * u    = ggml_mul_mat_id(ctx, up, x, ids);
         ggml_tensor * h    = ggml_swiglu_split(ctx, g, u);
@@ -8860,15 +8957,27 @@ struct test_moe_block : public test_case {
                     // skewed, distinct within a token (as a top-k routing): two rows in three take only the first half
                     // of the experts, so the other half sees few rows and some groups none
                     std::shuffle(perm.begin(), perm.end(), rng);
-                    const int lim = r % 3 == 0 ? n_mats : n_mats / 2;
+                    const int lim = getenv("AVALON_TEST_UNIFORM") || r % 3 == 0 ? n_mats : n_mats / 2;
                     std::vector<int32_t> data;
+                    if (getenv("AVALON_TEST_HOT")) data.push_back(0);
                     for (int i = 0; i < n_mats && (int) data.size() < t->ne[0]; i++) {
-                        if (perm[i] < lim) data.push_back(perm[i]);
+                        if (perm[i] < lim && (data.empty() || perm[i] != data[0])) data.push_back(perm[i]);
                     }
                     ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
                 }
             } else {
                 init_tensor_uniform(t);
+            }
+            if (const char * dir = getenv("AVALON_TEST_CAPTURE_DIR")) {
+                if (strcmp(t->name, "moe_x") == 0 || strcmp(t->name, "moe_ids") == 0) {
+                    std::vector<uint8_t> data(ggml_nbytes(t));
+                    ggml_backend_tensor_get(t, data.data(), 0, data.size());
+                    char path[4096];
+                    snprintf(path, sizeof(path), "%s/%s.bin", dir, t->name);
+                    FILE * f = fopen(path, "wb");
+                    GGML_ASSERT(f && fwrite(data.data(), 1, data.size(), f) == data.size());
+                    GGML_ASSERT(fclose(f) == 0);
+                }
             }
         }
     }
@@ -14259,6 +14368,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, bs, 4096, {1, 1}, {1, 1}));
         }
     }
+
+    // Phase 2 disposable screening case: expert count/usage and dtype from Qwen3.8.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_KS, GGML_TYPE_F32, 512, 10, true, 128, 512, 512));
+    test_cases.emplace_back(new test_moe_block(GGML_TYPE_IQ3_KS, GGML_TYPE_IQ4_NL, 512, 10, 256, 512, 512));
+    test_cases.emplace_back(new test_moe_block(GGML_TYPE_IQ3_KS, GGML_TYPE_IQ4_NL, 512, 10, 2560, 640, 128));
+    test_cases.emplace_back(new test_moe_block(GGML_TYPE_IQ3_KS, GGML_TYPE_IQ4_NL, 512, 10, 2560, 640, 2048));
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {

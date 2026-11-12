@@ -46,6 +46,26 @@ static __global__ void k_mmq_tile_prefix_groups(const int32_t * __restrict__ bou
 #include <cstdint>
 #include <functional>
 #include <cstring>
+#include <limits>
+
+// Experimental RDNA2 MoE tile heuristic. Keep the existing heuristic on invalid
+// dimensions or overflow and on every other architecture.
+static bool rdna2_mmq_avg_cols(int cc, int64_t n_tok, int64_t n_used, int64_t n_expert, int64_t & result) {
+    if (cc != GGML_CUDA_CC_RDNA2) {
+        return false;
+    }
+    static const bool enabled = [] {
+        const char * flag = getenv("AVALON_RDNA2_MMQ_AVG_TOKENS");
+        return flag && atoi(flag) != 0;
+    }();
+    if (!enabled || n_tok <= 0 || n_used <= 0 || n_expert <= 0 ||
+            n_tok > std::numeric_limits<int64_t>::max() / n_used) {
+        return false;
+    }
+    const int64_t rows = n_tok * n_used;
+    result = rows / n_expert + (rows % n_expert != 0);
+    return true;
+}
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
@@ -338,6 +358,8 @@ void ggml_cuda_mul_mat_q(
             // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
             if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
                 ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+            } else {
+                (void) rdna2_mmq_avg_cols(cc, ne12, n_expert_used, ne02, ncols_opt);
             }
         }
 
@@ -894,6 +916,8 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
     int64_t ncols_opt = n_tok;
     if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
         ncols_opt = (rows + n_expert - 1) / n_expert;
+    } else {
+        (void) rdna2_mmq_avg_cols(cc, n_tok, n_used, n_expert, ncols_opt);
     }
     const int J_gu = mmq_pick_J(wg->type, ncols_opt, fb_gu, cc, smpbo, GGML_PREC_Q8);
     const int J_d  = mmq_pick_J(wd->type, ncols_opt, fb_d,  cc, smpbo, GGML_PREC_Q8, dsum);
