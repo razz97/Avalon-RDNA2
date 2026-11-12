@@ -1,0 +1,10 @@
+# Diagnóstico “req1 ≠ req6” (smoke MTP)
+
+**Hallazgo del smoke original (arm B, prompts de relleno = código fuente, MTP ON):** la petición 1 y su repetición (6) daban salidas distintas (32 tokens vs 2 tokens `eos`).
+
+**Pruebas cortas de aislamiento** (servidor único en puerto de pruebas, binario P2 parcheado, temperature 0, seed 1, `cache_prompt=false`, `id_slot 0`):
+1. `scripts/r3-mtp-diag.py` (`results-r3/mtp-diag/`): prompt **natural** (2265 tokens, README del repo) ×2 consecutivas + prompt distinto + repetición, en A/B × MTP OFF/ON (4 servidores). Resultado: **req1 = req2 = req4 idénticas (mismo SHA, 48 tokens, `limit`) en las 4 configuraciones**, y el texto del prompt P1 es idéntico entre A y B y entre MTP OFF/ON. B con `MIN_KV=1024` y prefill de 2265 tokens activa la ruta nueva (el despacho de `k_fattn_qsa_rdna2` se probó con `r3-dispatch.sh`: B 12 llamadas, A 0).
+   - Anotación: el prompt corto P2 (10 tokens, sin ruta nueva) diverge entre A-OFF y B-OFF tras ~25 tokens (“o” vs “s”, empate de logprob casi igual: −0,006 vs −0,007 en el primer token); en las demás configuraciones coincide. Es una diferencia numérica de empate cercano, también presente con ruta nueva inactiva (el flag cambia reservas/plan de cómputo).
+2. Repetición del smoke original con **A** (`results-r3/smoke-A`, sin kernel nuevo): **también** req1≠req6 (1 token `eos` vs 2 tokens `eos`) y outputs distintos de B. Repetición con B (`smoke-B2`): esta vez `req1_equals_req6: true` (ambas 2 tokens `eos`), pero la petición 1 difiere de la del primer B (`smoke-B`: 32 tokens). Es decir, el mismo prompt da salidas distintas entre procesos B y A.
+
+**Conclusión:** la irreproducibilidad con prompts de relleno + MTP ON ocurre también con A y varía entre procesos del mismo brazo; **no es atribuible al kernel B**. Con prompt natural no hay diferencias de estado entre peticiones en ninguna configuración. **Causa raíz no aislada** (hipótesis: prompts de código fuera de distribución con empates de argmax + MTP/MoE; no probado). Según lo acordado no se profundiza más. Para G2 se considera “sin regresión atribuible a B” pero **no “sesión sin estado heredado demostrada”**.

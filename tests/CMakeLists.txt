@@ -303,6 +303,8 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
+# RDNA2 sparse prefill attention of QSA (needs a gfx1030 HIP device; run by hand, scripts/run-correctness.sh)
+llama_build(test-qsa-rdna2.cpp LINK ggml)
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")

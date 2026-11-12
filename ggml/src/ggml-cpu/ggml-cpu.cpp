@@ -480,6 +480,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return src1->type == GGML_TYPE_F32 ||
                    src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type ||
                    (src1->type == GGML_TYPE_BF16 && ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_F32);
+        case GGML_OP_FLASH_ATTN_EXT:
+            // a compact mask of the RDNA2 sparse prefill ([n_sel, n_t]) is not a dense [n_kv, n_t] one: only the HIP kernel reads it
+            return !(op->src[3] && op->src[3]->op == GGML_OP_QSA_SELECT &&
+                     ggml_get_op_params_i32(op->src[3], 1) == GGML_QSA_SELECT_RDNA2_PREFILL);
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;

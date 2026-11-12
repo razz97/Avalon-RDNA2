@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-qsa-rdna2.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -590,6 +591,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_QSA_RDNA2 = 500,   // sparse prefill of QSA on gfx1030 (fattn-qsa-rdna2.cu)
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -620,6 +622,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
+
+    // the compact mask of the RDNA2 sparse prefill ([n_sel, n_t], not [n_kv, n_t]): this kernel or nothing, none of the
+    // generic ones may read it
+    if (mask && mask->op == GGML_OP_QSA_SELECT && ggml_get_op_params_i32(mask, 1) == GGML_QSA_SELECT_RDNA2_PREFILL) {
+        return ggml_cuda_flash_attn_ext_qsa_rdna2_supported(device, dst) ? BEST_FATTN_KERNEL_QSA_RDNA2 : BEST_FATTN_KERNEL_NONE;
+    }
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
@@ -833,6 +841,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
             need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
         } break;
+        case BEST_FATTN_KERNEL_QSA_RDNA2: // K and V are read in place
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -900,6 +909,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_QSA_RDNA2:
+            if (!g_fattn_scratch_query) { // no scratch: a size query runs nothing
+                ggml_cuda_flash_attn_ext_qsa_rdna2(ctx, dst);
+            }
             break;
     }
 }

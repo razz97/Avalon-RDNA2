@@ -2733,6 +2733,7 @@ extern "C" {
     //
     // mode ROWS:   result I32 [n_sel, n_t], sel where it names a cell, 0 elsewhere (rows to gather)
     // mode MASK:   result F16 [n_sel, n_t], the visibility of the cell at a live slot, -inf at a dead one
+    // mode RDNA2_PREFILL: as MASK (see the enum)
     // mode DENSE:  result F16 [n_kv, n_t], the visibility at the cells of the live slots, -inf elsewhere
     // mode CAUSAL: result F16 [n_kv, n_t], the visibility of every cell (sel and top_score unused, may be NULL;
     //              positions only)
@@ -2748,6 +2749,10 @@ extern "C" {
         // the cells a tile of queries chose, for a sparse flash attention (ggml_qsa_select_tiles)
         GGML_QSA_SELECT_TILE_ROWS    = 7,
         GGML_QSA_SELECT_TILE_MASK    = 8,
+        // the compact mask of MASK ([n_sel, n_t]) for the native RDNA2 sparse prefill attention (flash attention over the
+        // selected cells of each query, K/V read in place): computed exactly as MASK; the flash attention that takes it
+        // as its mask also takes sel as its src[5]. Not ordered after TILE_*: test the mode for equality, not by range
+        GGML_QSA_SELECT_RDNA2_PREFILL = 9,
     };
 
     GGML_API struct ggml_tensor * ggml_qsa_select(

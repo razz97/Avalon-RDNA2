@@ -1,9 +1,13 @@
+#include <array>
+#include <map>
+#include <mutex>
 #include "models.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 
 // Small token batches (generation, an MTP verification): the token embedding rows gathered and dequantized by the host
@@ -1114,6 +1118,58 @@ static int32_t qsa_tile_cols() {
     return n;
 }
 
+// LLAMA_QSA_RDNA2_PREFILL=1 (default 0): the prefill of QSA layers from LLAMA_QSA_RDNA2_MIN_KV cells (default 20480) runs the
+// native sparse flash attention of gfx1030 (ggml-cuda/fattn-qsa-rdna2.cu), which reads the quantized K/V in place at the cells of
+// each query's selection, by a compact mask [n_sel, n_t]. Where it does not apply the attention is the dense slices: the tile
+// path (needs WMMA, absent on gfx1030) is not used while the feature is on
+static bool qsa_rdna2_prefill_on() {
+    static const bool on = [] { const char * e = getenv("LLAMA_QSA_RDNA2_PREFILL"); return e && atoi(e) != 0; }();
+    return on;
+}
+
+static int64_t qsa_rdna2_min_kv() {
+    static const int64_t n = [] { const char * e = getenv("LLAMA_QSA_RDNA2_MIN_KV"); return e && atoll(e) > 0 ? (int64_t) atoll(e) : (int64_t) 20480; }();
+    return n;
+}
+
+// does a GPU backend run the flash attention of this compact mask? asked with the node, as the scheduler will
+static bool qsa_rdna2_gpu_supports_uncached(ggml_context * ctx0, int64_t n_head, int64_t n_head_kv, int64_t D, int64_t n_sel, int64_t n_t,
+                                            int64_t n_kv_probe, ggml_type type_k, ggml_type type_v) {
+    ggml_tensor * q    = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, n_t, n_head, 1);
+    ggml_tensor * k    = ggml_new_tensor_4d(ctx0, type_k, D, n_kv_probe, n_head_kv, 1);
+    ggml_tensor * v    = ggml_new_tensor_4d(ctx0, type_v, D, n_kv_probe, n_head_kv, 1);
+    ggml_tensor * sel  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_sel, n_t);
+    ggml_tensor * sc   = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_t);
+    ggml_tensor * cp   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_kv_probe);
+    ggml_tensor * tp   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_t);
+    ggml_tensor * mask = ggml_qsa_select(ctx0, sel, sc, cp, tp, 1, GGML_QSA_SELECT_RDNA2_PREFILL);
+    ggml_tensor * fa   = ggml_flash_attn_ext(ctx0, q, k, v, mask, 1.0f, 0.0f, 0.0f);
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU && ggml_backend_dev_supports_op(dev, fa)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// the answer depends only on the shapes/types, and the backend set is fixed for the process: ask once per shape set
+// (the probe tensors cost graph metadata in every layer's context otherwise)
+static bool qsa_rdna2_gpu_supports(ggml_context * ctx0, int64_t n_head, int64_t n_head_kv, int64_t D, int64_t n_sel, int64_t n_t,
+                                   int64_t n_kv_probe, ggml_type type_k, ggml_type type_v) {
+    static std::mutex mtx;
+    static std::map<std::array<int64_t, 8>, bool> cache;
+    const std::array<int64_t, 8> key = { n_head, n_head_kv, D, n_sel, n_t, n_kv_probe, (int64_t) type_k, (int64_t) type_v };
+    std::lock_guard<std::mutex> lock(mtx);
+    const auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+    const bool r = qsa_rdna2_gpu_supports_uncached(ctx0, n_head, n_head_kv, D, n_sel, n_t, n_kv_probe, type_k, type_v);
+    cache.emplace(key, r);
+    return r;
+}
+
 // the blocks this ubatch completes or regroups, re-pooled into the cache
 void llama_model_qwen4exp::graph::add_new_pool_inputs(llm_graph_input_kpool * inp, const llama_memory_hybrid_idx_context * mctx_hyb,
                                                       uint32_t kpool) {
@@ -1141,7 +1197,8 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
         ggml_tensor *                           kq_mask,
         int *                                   sections,
         int                                     il,
-        bool                                    store_only) {
+        bool                                    store_only,
+        const llama_kv_cache_context *          mctx_attn) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
 
     const int64_t idx_dim = hparams.indexer_head_size;
@@ -1362,7 +1419,52 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     // with the tile mask of its own queries (their selections by the indexer's slices inside it); build_layer_attn then
     // runs the query projection, the attention, its gate and the output projection slice by slice
     static const int64_t att_slice = [] { const char * e = getenv("LLAMA_QSA_ATT_SLICE"); return e ? (int64_t) atoll(e) & ~(int64_t) 15 : (int64_t) 4096; }();
-    if (qsa_tiles && att_slice > 0 && att_slice < n_tokens && pos_mode && cparams.flash_attn) {
+    // the RDNA2 sparse prefill (LLAMA_QSA_RDNA2_PREFILL): one compact mask [n_sel, n_tokens] for one flash attention of all
+    // the queries, which reads K/V in place at the selected cells (no tile lists, no dense mask, no gather). The indexer's
+    // scores still go by slices (their [n_pool, n_t] F32 grows with the context), the selections are joined
+    const bool rdna2_on = qsa_rdna2_prefill_on();
+    if (rdna2_on && n_tokens >= 64 && n_kv >= qsa_rdna2_min_kv()) {
+        const char * why = nullptr;
+        const int64_t D = hparams.n_embd_head_k();
+        if (!pos_mode)                                              why = "no position mode (visibility by a KQ mask)";
+        else if (!cparams.flash_attn)                               why = "flash attention is off";
+        else if (kq_mask->ne[2]*kq_mask->ne[3] != 1)                why = "more than one sequence";
+        else if (!mctx_attn || mctx_attn->type_k() != GGML_TYPE_Q8_0 || mctx_attn->type_v() != GGML_TYPE_Q4_0) why = "KV cache is not Q8_0 K / Q4_0 V";
+        else if (D != 256 || hparams.n_head_kv(il) == 0 || hparams.n_head(il) % hparams.n_head_kv(il) != 0 ||
+                 (hparams.n_head(il) / hparams.n_head_kv(il)) % 4 != 0) why = "head geometry (D=256, GQA ratio multiple of 4)";
+        else if (!qsa_rdna2_gpu_supports(ctx0, hparams.n_head(il), hparams.n_head_kv(il), D, n_sel, n_tokens, n_kv,
+                                         GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)) {
+            GGML_ABORT("LLAMA_QSA_RDNA2_PREFILL=1 but no GPU backend supports the RDNA2 sparse flash attention "
+                       "(it needs a gfx1030 HIP device and a binary built for it); unset it to use the dense path");
+        }
+        if (why) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true)) {
+                LLAMA_LOG_WARN("%s: LLAMA_QSA_RDNA2_PREFILL: dense slices instead of the sparse prefill: %s\n", __func__, why);
+            }
+        } else {
+            ggml_tensor * sel_all   = nullptr;
+            ggml_tensor * score_all = nullptr;
+            for (int64_t t0 = 0; t0 < n_tokens; t0 += n_slice) {
+                const slice_sel ss = select(t0, std::min(n_slice, n_tokens - t0));
+                sel_all   = sel_all   ? ggml_concat(ctx0, sel_all,   ss.sel_idx,   1) : ss.sel_idx;
+                score_all = score_all ? ggml_concat(ctx0, score_all, ss.top_score, 1) : ss.top_score;
+                // queued now, so that the next slice can reuse this one's scores
+                ggml_build_forward_expand(gf, sel_all);
+                ggml_build_forward_expand(gf, score_all);
+            }
+            res_d.sparse_prefill_mask = ggml_qsa_select(ctx0, sel_all, score_all, inp_kpool->cell_pos, inp_kpool->tok_pos,
+                                                        (int32_t) kpool, GGML_QSA_SELECT_RDNA2_PREFILL);
+            cb(res_d.sparse_prefill_mask, "indexer_sel_sparse", il);
+            // the selection stays an input of the attention (flash_attn_ext's sources[5]); the mask is queued after it
+            ggml_build_forward_expand(gf, res_d.sparse_prefill_mask);
+            return res_d;
+        }
+    }
+    // with the feature on, no tile path (it needs WMMA): below the threshold or where the sparse kernel does not apply the
+    // attention is the dense one
+    const bool qsa_tiles_eff = qsa_tiles && !rdna2_on;
+    if (qsa_tiles_eff && att_slice > 0 && att_slice < n_tokens && pos_mode && cparams.flash_attn) {
         res_d.tiles_slice = [=, this](int64_t t0, int64_t n) {
             ggml_tensor * sel_s   = nullptr;
             ggml_tensor * score_s = nullptr;
@@ -1383,7 +1485,7 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
         res_d.n_att_slice = GGML_PAD((n_tokens + n_sl - 1) / n_sl, 16);
         return res_d;
     }
-    if (qsa_tiles && (n_slice < n_tokens || qsa_tiles_all) && pos_mode && cparams.flash_attn && n_tokens > 8) {
+    if (qsa_tiles_eff && (n_slice < n_tokens || qsa_tiles_all) && pos_mode && cparams.flash_attn && n_tokens > 8) {
         ggml_tensor * sel_all   = nullptr;
         ggml_tensor * score_all = nullptr;
         for (int64_t t0 = 0; t0 < n_tokens; t0 += n_slice) {
@@ -1478,6 +1580,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         return cur;
     }
 
+    if (sel.sparse_prefill_mask) {
+        // K and V as they are in the cache (Q8_0 / Q4_0): the sparse kernel dequantizes the selected cells only. No get_rows,
+        // no F16 copy of the cache; n_sel (not n_kv) is the flash attention's n_kv_max
+        ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel.sparse_prefill_mask, nullptr, nullptr, n_sel, kq_scale, il);
+        cb(cur, "kqv_out", il);
+
+        if (inp->self_v_rot) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->mctx->layer_rot(inp->self_v_rot, il));
+        }
+        return cur;
+    }
+
     if (sel.tiles) {
         // one flash attention for all the queries, by the tile mask; a q8_0 K and a q4_0 V stay as they are: ggml-cuda
         // gathers them quantized from 64k cells (no f16 copy), below converts them once in the flash attention's node
@@ -1561,7 +1675,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     qsa_sel sel;
     if (qsa) {
-        sel = build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, inp->get_kq_mask(), sections, il, kv_only);
+        sel = build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, inp->get_kq_mask(), sections, il, kv_only, inp->mctx);
     }
 
     if (kv_only) {
