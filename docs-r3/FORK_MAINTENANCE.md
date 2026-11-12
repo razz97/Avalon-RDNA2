@@ -5,8 +5,8 @@ Status of the RDNA2 QSA sparse prefill: **EXPERIMENTAL** (docs-r3/STATUS.md). `L
 ## Layout
 - `origin`   = https://github.com/razz97/Avalon-RDNA2 (PRIVATE).
 - `upstream` = https://github.com/freriadoc/Avalon (public, never push there).
-- `main` = pristine mirror of `upstream/main` (never commit experimental work here; fast-forward only).
-- `feat/rdna2-qsa-prefill` = our work (base e09e775fe540cf8526b62b0f98b924c0ed7eb414, ~10 commits + docs). Not merged into main.
+- `main` = our integrated fork (upstream + RDNA2 QSA sparse prefill, MoE ring lazy-init fix, 20K threshold). Branch experiments from here. Upstream is tracked by `upstream/main`; sync by merging it (conflicts expected as listed below).
+- `feat/rdna2-mmq-mmvq-indexer` = archived phase-2 MMQ/MMVQ/indexer experiments (NO-GO, all OFF by default); not merged.
 - Large artefacts (results/, results-r3/, models, builds) are NOT in the repo; the R2/R3 ZIPs hold the evidence.
 
 ## Update from upstream (keeps our branch isolated)
