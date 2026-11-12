@@ -15,6 +15,7 @@
 #include "common.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -31,6 +32,7 @@ int main(int argc, char ** argv) {
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_PERPLEXITY)) {
         return 1;
     }
+    params.warmup = true;   // like the server: perplexity-style parsing disables it
     const std::string mode = envs("QSA_NLL_MODE"), in = envs("QSA_NLL_IN"), outp = envs("QSA_NLL_OUT");
     if (in.empty() || outp.empty()) { fprintf(stderr, "QSA_NLL_IN / QSA_NLL_OUT required\n"); return 2; }
 
@@ -59,6 +61,7 @@ int main(int argc, char ** argv) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int n_vocab = llama_vocab_n_tokens(vocab);
     const int chunk = (int) llama_n_ubatch(ctx);
+    const bool cut = envs("QSA_NLL_CUT") == "1";   // cut chunks at scored positions (1 output per decode) instead of n outputs per full chunk
 
     std::ifstream f(in);
     std::ofstream o(outp);
@@ -74,23 +77,28 @@ int main(int argc, char ** argv) {
         for (auto & t : tok) f >> t;
         std::vector<int> pos(np);
         for (auto & p : pos) f >> p;
-        std::vector<char> want(nt, 0);      // want[i]: logits needed at batch index i (predicts token i+1)
-        for (int p : pos) { if (p < 1 || p >= nt) { fprintf(stderr, "bad pos %d\n", p); return 5; } want[p - 1] = 1; }
+        for (int p : pos) { if (p < 1 || p >= nt) { fprintf(stderr, "bad pos %d\n", p); return 5; } }
 
         llama_memory_clear(llama_get_memory(ctx), true);
         std::vector<double> nll(nt, NAN);
         const auto t0 = std::chrono::steady_clock::now();
         bool err = false;
-        for (int s = 0; s < nt && !err; s += chunk) {
-            const int n = std::min(chunk, nt - s);
+        // Chunks of n_ubatch tokens, cut so that every scored position p ends a chunk (logits requested only at the LAST token of a
+        // chunk, exactly like the server). Requesting logits at several tokens of one batch is a path the server never uses and is
+        // pathologically slow in this fork (~100x), hence this shape.
+        for (int s = 0; s < nt && !err;) {
+            int e = std::min(s + chunk, nt);
+            if (cut) { for (int p : pos) { if (p > s && p < e) { e = p; } } }   // p = first token NOT in the chunk: logits of index p-1 predict token p
+            const int n = e - s;
+            const bool score = cut && std::find(pos.begin(), pos.end(), e) != pos.end();
             batch.n_tokens = n;
             for (int i = 0; i < n; i++) {
                 batch.token[i] = tok[s + i]; batch.pos[i] = s + i; batch.n_seq_id[i] = 1; batch.seq_id[i][0] = 0;
-                batch.logits[i] = want[s + i];
+                batch.logits[i] = cut ? ((score && i == n - 1) ? 1 : 0) : (std::find(pos.begin(), pos.end(), s + i + 1) != pos.end() ? 1 : 0);
             }
             if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "llama_decode failed\n"); err = true; break; }
             for (int i = 0; i < n; i++) {
-                if (!want[s + i]) continue;
+                if (!batch.logits[i]) continue;
                 const float * lg = llama_get_logits_ith(ctx, i);
                 if (!lg) { fprintf(stderr, "no logits at %d\n", s + i); err = true; break; }
                 double mx = -INFINITY;
@@ -99,6 +107,7 @@ int main(int argc, char ** argv) {
                 for (int v = 0; v < n_vocab; v++) se += std::exp((double) lg[v] - mx);
                 nll[s + i + 1] = (mx + std::log(se)) - (double) lg[tok[s + i + 1]];
             }
+            s = e;
         }
         const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         if (!first_rec) o << ",\n";
