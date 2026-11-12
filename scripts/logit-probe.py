@@ -45,6 +45,8 @@ root = subprocess.check_output([str(ab.P / 'rocm-7.14.1-venv/bin/rocm-sdk'), 'pa
 env.update(ROCM_PATH=root, HIP_PATH=root, LD_LIBRARY_PATH=root + '/lib:' + root + '/lib/llvm/lib', GPU_MAX_HW_QUEUES='2', HSA_ENABLE_SDMA='1')
 model = ab.D / 'models/Qwen3.8-Flash-Next-Avalon-IQ3KS/Qwen3.8-Flash-Next-Avalon-IQ3KS-00001-of-00033.gguf'
 argv = ab.build_server_argv(model, 6, x.batch, x.ubatch, x.mtp, cfg)
+import shlex
+if os.environ.get('PROBE_WRAP'): argv = shlex.split(os.environ['PROBE_WRAP']) + argv   # e.g. rocprofv3 ... --
 outp = Path(x.out); outp.parent.mkdir(parents=True, exist_ok=True)
 log = open(str(outp) + '.engine.log', 'w')
 srv = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, env=env, cwd=model.parent, start_new_session=True)
