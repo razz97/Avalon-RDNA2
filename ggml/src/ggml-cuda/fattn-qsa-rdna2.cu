@@ -12,6 +12,9 @@
 
 #define QSA_R2_BN   32
 #define QSA_R2_NT   256
+#ifndef QSA_R2_WAVES_PER_EU
+#define QSA_R2_WAVES_PER_EU 8   // P2: cap VGPRs at 128 so two 8-wave CTAs share a CU (was 240 VGPR = 1 CTA/CU)
+#endif
 #define QSA_R2_HG   4                       // query heads per CTA
 #define QSA_R2_KW   68                      // words of one K row of one head: 8 Q8_0 blocks of 34 bytes
 #define QSA_R2_KS   69                      // its LDS stride in words (odd: the 32 lanes read 32 banks)
@@ -43,7 +46,7 @@ static __device__ __forceinline__ void qsa_r2_load_q(half2 * q, const char * src
 }
 
 template <typename TQ, bool HP>
-__launch_bounds__(QSA_R2_NT)
+__launch_bounds__(QSA_R2_NT) __attribute__((amdgpu_waves_per_eu(QSA_R2_WAVES_PER_EU)))
 static __global__ void k_fattn_qsa_rdna2(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
         const half * __restrict__ mask, const int32_t * __restrict__ idx, char * __restrict__ dst,
