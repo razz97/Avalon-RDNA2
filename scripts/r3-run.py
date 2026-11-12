@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """R3: run llama-qsa-nll once for one arm (one process, several prompt records) with the same engine environment as the R2 harness.
 Usage: r3-run.py --arm A|B --spec FILE --out DIR [--min-kv N] [--wrap 'rocprofv3 ... --'] [--meta prompts.json]
-Always uses the PATCHED P2 binary dir (R3_BIN_DIR, default build-hip-gfx1030-qsa/bin); refuses anything else."""
+Always uses the PATCHED P2 binary dir (R3_BIN_DIR, default build-main/bin); refuses anything else."""
 import argparse, hashlib, importlib.util, json, os, signal, subprocess, shlex, sys, threading, time, types
 from pathlib import Path
 here = Path(__file__).resolve().parent; repo = here.parent
@@ -10,8 +10,8 @@ a = argparse.ArgumentParser()
 a.add_argument('--arm', required=True, choices='AB'); a.add_argument('--spec', required=True); a.add_argument('--out', required=True)
 a.add_argument('--min-kv', default='32768'); a.add_argument('--wrap'); a.add_argument('--tag', default=''); a.add_argument('--ub', default='4096')
 x = a.parse_args()
-binp = Path(os.environ.get('R3_BIN_DIR', repo / 'build-hip-gfx1030-qsa/bin')).resolve() / 'llama-qsa-nll'
-assert str(binp).startswith(str(repo / 'build-hip-gfx1030-qsa')), 'must be the patched build'
+binp = Path(os.environ.get('R3_BIN_DIR', repo / 'build-main/bin')).resolve() / 'llama-qsa-nll'
+assert str(binp).startswith(str(repo / 'build-main')), 'must be the patched build'
 out = Path(x.out).resolve(); out.mkdir(parents=True, exist_ok=True)
 common = {'GGML_SCHED_BORROW_COMPUTE': '1', 'LLAMA_QSA_TILES': '0', 'LLAMA_QSA_TILES_ALL': '0'}
 armenv = {'LLAMA_QSA_RDNA2_PREFILL': '0'} if x.arm == 'A' else {'LLAMA_QSA_RDNA2_PREFILL': '1', 'LLAMA_QSA_RDNA2_MIN_KV': x.min_kv}

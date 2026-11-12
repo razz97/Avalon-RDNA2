@@ -7,7 +7,7 @@ from pathlib import Path
 here = Path(__file__).resolve().parent; repo = here.parent
 spec = importlib.util.spec_from_file_location('ab', here / 'oneshot-ab.py'); ab = importlib.util.module_from_spec(spec); spec.loader.exec_module(ab)
 out = Path(sys.argv[1]).resolve(); out.mkdir(parents=True, exist_ok=True)
-bind = repo / 'build-hip-gfx1030-qsa/bin'
+bind = repo / 'build-main/bin'
 md = ab.D / 'models/Qwen3.8-Flash-Next-Avalon-IQ3KS'; model = md / 'Qwen3.8-Flash-Next-Avalon-IQ3KS-00001-of-00033.gguf'
 root = subprocess.check_output([str(ab.P / 'rocm-7.14.1-venv/bin/rocm-sdk'), 'path', '--root'], text=True).strip()
 text = open(repo / 'README.md').read()[:7000]   # natural English prose from the repo README, no filler code

@@ -8,7 +8,7 @@ here = Path(__file__).resolve().parent; repo = here.parent
 spec = importlib.util.spec_from_file_location('ab', here / 'oneshot-ab.py'); ab = importlib.util.module_from_spec(spec); spec.loader.exec_module(ab)
 ARM = sys.argv[2] if len(sys.argv) > 2 else 'B'
 out = Path(sys.argv[1]).resolve(); out.mkdir(parents=True, exist_ok=True)
-bind = repo / 'build-hip-gfx1030-qsa/bin'
+bind = repo / 'build-main/bin'
 ab.AB_ENV.clear(); ab.AB_ENV.update({'GGML_SCHED_BORROW_COMPUTE': '1', 'LLAMA_QSA_TILES': '0', 'LLAMA_QSA_TILES_ALL': '0', **({'LLAMA_QSA_RDNA2_PREFILL': '1', 'LLAMA_QSA_RDNA2_MIN_KV': '1024'} if ARM == 'B' else {'LLAMA_QSA_RDNA2_PREFILL': '0'})}); ab.BIN_DIR = bind
 if ab.games(): sys.exit('competing processes')
 env = ab.child_environment(os.environ, None, None)

@@ -26,7 +26,7 @@ for cls in ('short', 'long'):
         if mA[k] != mB[k]: res['problems'].append(f'{cls}: A/B differ in {k}')
     pa = {k: v for k, v in mA['flags'].items() if k.startswith('LLAMA_QSA')}; pb = {k: v for k, v in mB['flags'].items() if k.startswith('LLAMA_QSA')}
     if pa.get('LLAMA_QSA_RDNA2_PREFILL') != '0' or pb.get('LLAMA_QSA_RDNA2_PREFILL') != '1' or pa.get('LLAMA_QSA_TILES') != '0' or pb.get('LLAMA_QSA_TILES') != '0': res['problems'].append(f'{cls}: wrong A/B flags {pa} {pb}')
-    if '/build-hip-gfx1030-qsa/' not in mA['binary_realpath'] or mA['binary_realpath'] != mB['binary_realpath']: res['problems'].append(f'{cls}: binary is not the patched build')
+    if '/build-main/' not in mA['binary_realpath'] or mA['binary_realpath'] != mB['binary_realpath']: res['problems'].append(f'{cls}: binary is not the patched build')
     if mA['rc'] or mB['rc']: res['problems'].append(f'{cls}: nonzero rc')
     ka, kb = (kernel_calls(runs.parent / 'dispatch' / 'A'), kernel_calls(runs.parent / 'dispatch' / 'B')) if cls == 'short' else (None, None)
     res['checks'][cls] = {'A_flags': pa, 'B_flags': pb, 'binary_sha256': mB['binary_sha256'], 'binary_realpath': mB['binary_realpath'], 'commit': mB['commit'],

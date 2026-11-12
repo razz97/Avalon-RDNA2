@@ -5,7 +5,7 @@ set -euo pipefail
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 ARM="$1"; TOK="$2"; BATCH="$3"; UB="$4"; shift 4
 V="${ROCM_VENV:-$HOME/.local/share/lifeos-inference/avalon-q8-prep-e09e775/rocm-7.14.1-venv}"
-export AB_BIN_DIR="${BUILD_DIR:-$SRC/build-hip-gfx1030-qsa}/bin"
+export AB_BIN_DIR="${BUILD_DIR:-$SRC/build-main}/bin"
 common='"GGML_SCHED_BORROW_COMPUTE":"1","LLAMA_QSA_TILES":"0","LLAMA_QSA_TILES_ALL":"0"'
 if [ "$ARM" = A ]; then export AB_ENV="{$common,\"LLAMA_QSA_RDNA2_PREFILL\":\"0\"}"
 else export AB_ENV="{$common,\"LLAMA_QSA_RDNA2_PREFILL\":\"1\",\"LLAMA_QSA_RDNA2_MIN_KV\":\"32768\"}"; fi

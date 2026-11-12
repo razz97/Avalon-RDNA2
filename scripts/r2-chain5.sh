@@ -3,7 +3,7 @@
 # results/probes-baseline-binary as baseline run-to-run noise evidence only).
 cd "$(dirname "$0")/.."
 L=results/logs/r2q; mkdir -p $L results/probes
-BIN=$PWD/build-hip-gfx1030-qsa/bin
+BIN=$PWD/build-main/bin
 date '+%Y-%m-%d %H:%M:%S' > $L/kernel-since
 P() { name=$1; shift; python3 scripts/logit-probe.py --bin-dir $BIN --out results/probes/$name.json "$@" > $L/$name.out 2>&1 < /dev/null || echo "FAILED probe $name" >> $L/fail; }
 for i in 1 2 3; do P q-A-free-$i --arm A; done
