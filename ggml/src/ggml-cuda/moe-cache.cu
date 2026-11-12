@@ -11049,6 +11049,9 @@ static void moe_cache_ring_zone(void * opaque, void * backend, void * base, size
     if (!device) {
         return;
     }
+    if (!base && !device->ring) {
+        return; // releasing a ring that was never created: do not create its stream and events just to tear them down
+    }
     ggml_cuda_set_device(device->logical);
     if (!device->ring) {
         device->ring = new moe_ring_state();
